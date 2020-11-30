@@ -7,6 +7,7 @@ import argparse
 import traceback
 import os
 import string
+import re
 from io import StringIO
 from pdfminer.pdfparser import PDFParser
 from pdfminer.pdfdocument import PDFDocument
@@ -26,6 +27,14 @@ WITHIN_WORD_MOVE_LIMIT = 0
 ALGO = "original"
 TITLE_CASE = False
 
+
+def set_globals(verbose=False, missing_char=None, within_word_move_limit=0, algo='original', title_case=False):
+    global VERBOSE, MISSING_CHAR, WITHIN_WORD_MOVE_LIMIT, ALGO, TITLE_CASE
+    VERBOSE = verbose
+    MISSING_CHAR = missing_char
+    WITHIN_WORD_MOVE_LIMIT = within_word_move_limit
+    ALGO = algo
+    TITLE_CASE = title_case
 
 def verbose(*s):
     if VERBOSE:
@@ -391,7 +400,11 @@ class TextOnlyDevice(PDFDevice):
             if force_space:
                 unichar = ' '
             else:
-                unichar = ts.Tf.to_unichr(cid)
+                try:
+                    unichar = ts.Tf.to_unichr(cid)
+                except Exception as e:
+                    verbose(f"Failed to process {cid = }: {e}")
+                    unichar = ' '
         except PDFUnicodeNotDefined:
             if MISSING_CHAR:
                 unichar = MISSING_CHAR
@@ -424,7 +437,7 @@ class TextOnlyDevice(PDFDevice):
 
 
 # pylint: disable=too-many-branches, too-many-locals, too-many-statements
-def get_title_from_io(pdf_io):
+def get_title_from_io(pdf_io, min_ch, min_wd):
     parser = PDFParser(pdf_io)
     # if pdf is protected with a pwd, 2nd param here is password
     doc = PDFDocument(parser)
@@ -453,104 +466,201 @@ def get_title_from_io(pdf_io):
 
         for b in dev.blocks:
             verbose(b)
+        
+        title = None
+        max_tfs_cutoff = None
+        tfs_tol = 1
+        y_tol = 1
+        max_num_iter = 4 # number of times to lower max_tfs_cutoff if title too short or too few words.
+        tfs_iter = 0
+        while tfs_iter < max_num_iter and (not title or (min_ch > 1 and len(title) < min_ch) or (min_wd > 1 and len(title.split(' ')) > 1 and len(title.split(' ')) < min_wd)):
+            tfs_iter += 1
+            # pylint: disable=W0603
+            # global ALGO # don't neet 'global ALGO' as it's not being modified, can still read it.
+            if ALGO == "original":
+                # find max font size
+                max_tfs = max([b for b in dev.blocks if (not max_tfs_cutoff or b[1] < max_tfs_cutoff)], key=lambda x: x[1])[1]
+                verbose('max_tfs: ', max_tfs)
+                # find max blocks with max font size
+                max_blocks = list(filter(lambda x: abs(x[1] - max_tfs) < tfs_tol, dev.blocks))
+                # find the one with the highest y coordinate
+                # this is the most close to top
+                max_y = max(max_blocks, key=lambda x: x[3])[3]
+                verbose('max_y: ', max_y)
+                found_blocks = list(filter(lambda x: abs(x[3] - max_y) < y_tol, max_blocks))
+                verbose('found blocks')
 
-        # pylint: disable=W0603
-        global ALGO
-        if ALGO == "original":
-            # find max font size
-            max_tfs = max(dev.blocks, key=lambda x: x[1])[1]
-            verbose('max_tfs: ', max_tfs)
-            # find max blocks with max font size
-            max_blocks = list(filter(lambda x: x[1] == max_tfs, dev.blocks))
-            # find the one with the highest y coordinate
-            # this is the most close to top
-            max_y = max(max_blocks, key=lambda x: x[3])[3]
-            verbose('max_y: ', max_y)
-            found_blocks = list(filter(lambda x: x[3] == max_y, max_blocks))
-            verbose('found blocks')
-
-            for b in found_blocks:
-                verbose(b)
-            block = found_blocks[0]
-            title = ''.join(block[4]).strip()
-
-        elif ALGO == "max2":
-            # find max font size
-            all_tfs = sorted(list(map(lambda x: x[1], dev.blocks)), reverse=True)
-            max_tfs = all_tfs[0]
-            verbose('max_tfs: ', max_tfs)
-            selected_blocks = []
-            max2_tfs = -1
-            for b in dev.blocks:
-                if max2_tfs == -1:
-                    if b[1] == max_tfs:
-                        selected_blocks.append(b)
-                    elif len(selected_blocks) > 0: # max is added
-                        selected_blocks.append(b)
-                        max2_tfs = b[1]
-                else:
-                    if b[1] == max_tfs or b[1] == max2_tfs:
-                        selected_blocks.append(b)
+                for b in found_blocks:
+                    verbose(b)
+                    
+                title = ''
+                for b in found_blocks:
+                    title += ''.join(b[4])
+            elif ALGO == "max2":
+                # find max font size
+                all_tfs = sorted(list(map(lambda x: x[1], [b for b in dev.blocks if (not max_tfs_cutoff or b[1] < max_tfs_cutoff)])), reverse=True)
+                max_tfs = all_tfs[0]
+                verbose('max_tfs: ', max_tfs)
+                selected_blocks = []
+                max2_tfs = -1
+                for b in dev.blocks:
+                    if max2_tfs == -1:
+                        if abs(b[1] - max_tfs) < tfs_tol:
+                            selected_blocks.append(b)
+                        elif len(selected_blocks) > 0: # max is added
+                            selected_blocks.append(b)
+                            max2_tfs = b[1]
                     else:
-                        break
+                        if abs(b[1] - max_tfs) < tfs_tol or abs(b[1] - max2_tfs) < tfs_tol:
+                            selected_blocks.append(b)
+                        else:
+                            break
 
-            for b in selected_blocks:
-                verbose(b)
+                for b in selected_blocks:
+                    verbose(b)
 
-            title = []
-            for b in selected_blocks:
-                title.append(''.join(b[4]))
-            title = ''.join(title)
+                title = ''
+                for b in selected_blocks:
+                    title += ''.join(b[4])
+            elif ALGO == "max_position":
+                # find max font size
+                max_tfs = max([b for b in dev.blocks if (not max_tfs_cutoff or b[1] < max_tfs_cutoff)], key=lambda x: x[1])[1]
+                verbose('max_tfs: ', max_tfs)
+                # find max blocks with max font size
+                tfs_tol = 1
+                max_blocks = [b for b in dev.blocks if abs(b[1] - max_tfs) < tfs_tol]
+                for b in max_blocks:
+                    verbose(b)
+                # Now use the y-range of max_blocks as the check
+                # for all blocks, with a much higher tolerance for
+                # tfs to account for sub/superscript characters which
+                # can vary by +/- 10pts.
+                y_max = max(max_blocks, key=lambda x: x[3])[3]
+                y_min = min(max_blocks, key=lambda x: x[3])[3]
+                y_range = y_max - y_min
+                y_mid = (y_max + y_min) * 0.5
+                verbose(f"{y_range = }, {y_mid = }")
+                # find the one with the highest y coordinate
+                # this is the most close to top
+                y_tol = 2
+                tfs_tol = 8
+                found_blocks = [b for b in dev.blocks if b in max_blocks or (b[3] <= y_max + y_tol and b[3] >= y_min - y_tol and abs(b[1] - max_tfs) < tfs_tol)]
+                verbose('found blocks')
 
-        else:
-            raise Exception("unsupported ALGO")
+                for b in found_blocks:
+                    verbose(b)
+                    
+                title = ''
+                for b in found_blocks:
+                    title += ''.join(b[4])
+            else:
+                raise Exception("unsupported ALGO")
+            
+        
+            max_tfs_cutoff = max_tfs
+            
+            verbose(f"before retrieving spaces, {title = }")
+            
+            # Retrieve missing spaces if needed
+            # if " " not in title:
+            #     title = retrieve_spaces(first_page_text, title)
+            new_title = retrieve_spaces_word_based(first_page_text, title.replace(' ',''))
+            if len(new_title) > len(title):
+                title = new_title
 
-        # Retrieve missing spaces if needed
-        if " " not in title:
-            title = retrieve_spaces(first_page_text, title)
-
-        # Remove duplcate spaces if any are present
-        if "  " in title:
-            title = " ".join(title.split())
+            # Remove duplcate spaces if any are present
+            if "  " in title:
+                title = " ".join(title.split())
 
         return title
     else:
         return None
 
 
-def get_title_from_file(pdf_file):
+def get_title_from_file(pdf_file, min_ch = 5, min_wd = 0):
     with open(pdf_file, 'rb') as raw_file:
-        return get_title_from_io(raw_file)
+        return get_title_from_io(raw_file, min_ch, min_wd)
 
 
-def retrieve_spaces(first_page, title_without_space, p=0, t=0, result=""):
+def retrieve_spaces(first_page, title_without_space):
     # Correct the space problem
     #  if the document does not use space character between the words
     # Stop condition : all the first page has been explored or
     #  we have explored all the letters of the title
 
-    # pylint: disable=no-else-return
-    if (p >= len(first_page) or t >= len(title_without_space)):
-        return result
+    p=0
+    t=0
+    result=""
+    
+    verbose(first_page)
+    
+    while p < len(first_page) and t < len(title_without_space):
+        verbose(f"comparing {first_page[p] = } to {title_without_space[t] = }")
+        if first_page[p].lower() == title_without_space[t].lower():
+            result += first_page[p]
+            verbose(f"Added {first_page[p] = } to {result = }")
+            t += 1
+        elif t != 0:
+            # Add spaces if there is space or a wordwrap
+            if first_page[p] == " " or first_page[p] == "\n":
+                result += " "
+            # If letter p-1 in page corresponds to letter t-1 in title,
+            #  but letter p does not corresponds to letter t,
+            # we are not exploring the title in the page
+            else:
+                t = 0
+                result = ""
+                
+        p += 1
+    
+    return result
 
-    # Add letter to our result if it corresponds to the title
-    elif first_page[p].lower() == title_without_space[t].lower():
-        result += first_page[p]
-        t += 1
+def retrieve_spaces_word_based(first_page, title_without_space):
+    # for this approach, search for individual words
+    # using str.find, which searches from the left,
+    # so when a word is found it's likely the first
+    # word of the title.
+    # When a word is found, perform the next search
+    # from the previous words ending position in the
+    # title.
+    # If anything is skipped (i.e. the search position is 
+    # greater the starting index) add whatever's skipped
+    # as a word.
+    # This method also allows for cases where a title is split
+    # in first_page by the texr that, in the rendered PDF, 
+    # comes after.
+    
+    
+    p=0
+    t=0
+    result=""
+    
+    verbose(first_page)
+    
+    new_title = ""
 
-    elif t != 0:
-        # Add spaces if there is space or a wordwrap
-        if first_page[p] == " " or first_page[p] == "\n":
-            result += " "
-        # If letter p-1 in page corresponds to letter t-1 in title,
-        #  but lette p does not corresponds to letter p,
-        # we are not exploring the title in the page
-        else:
-            t = 0
-            result = ""
-
-    return retrieve_spaces(
-        first_page, title_without_space, p+1, t, result)
+    first_page_words = re.sub(r'\(cid:[0-9]+\)', ' ', first_page)
+    first_page_words = first_page_words.replace('\n',' ').split(' ')
+    title_lower = title_without_space.lower()
+    for w in first_page_words:
+        if w == '':
+            continue
+        verbose(f"Searching for {w}")
+        pos = title_lower.find(w.lower(), t)
+        if pos >= 0 and pos >= t:
+            verbose(f"Found at {pos = }")
+            # if t > 0 and not new_title.endswith(w + " ")
+            if pos > t:
+                verbose(f"adding {title_without_space[t:pos] = }")
+                new_title += title_without_space[t:pos] + " "
+            verbose(f"adding {w = }")
+            new_title += w + " "
+            verbose(f"{t = }, {pos = }, {len(w) = }, {new_title = }")
+            t = pos + len(w)
+        if t >= len(title_lower):
+            return new_title
+    
+    return new_title.strip()
 
 
 def run():
@@ -574,6 +684,10 @@ def run():
         parser.add_argument('-t', '--title-case', action='store_true',
                             help='modify the case of final title to be ' +
                             'title case')
+        parser.add_argument('--min_characters', type=int, default=5, \
+                            help='minimum number of characters in title')
+        parser.add_argument('--min_words', type=int, default=0, \
+                            help='minimum number of words in title')
         parser.add_argument('-v', '--verbose',
                             action='store_true',
                             help='enable verbose logging')
@@ -586,7 +700,7 @@ def run():
         MISSING_CHAR = args.replace_missing_char
         ALGO = args.algo
         TITLE_CASE = args.title_case
-        title = get_title_from_file(args.pdf)
+        title = get_title_from_file(args.pdf, min_ch=args.min_characters, min_wd=args.min_words)
 
         if TITLE_CASE:
             verbose('before title case: %s' % title)
